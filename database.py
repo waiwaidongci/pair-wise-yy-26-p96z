@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -9,6 +10,14 @@ from pathlib import Path
 
 class DomainError(ValueError):
     """Business rule violation."""
+
+
+class PublicIdConflict(DomainError):
+    """Public identifier already held by another report."""
+
+    def __init__(self, message: str, holder: dict) -> None:
+        super().__init__(message)
+        self.holder = holder
 
 
 STATUS_TRANSITIONS = {
@@ -141,6 +150,34 @@ class VulnerabilityDB:
               created_at TEXT NOT NULL,
               published_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS public_id_registrations (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              identifier TEXT NOT NULL,
+              report_id INTEGER NOT NULL REFERENCES reports(id),
+              reserved_until TEXT NOT NULL,
+              advisory_url TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'reserved' CHECK(status IN ('reserved','renewed','withdrawn')),
+              created_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_public_id_active
+              ON public_id_registrations(identifier) WHERE status != 'withdrawn';
+            CREATE INDEX IF NOT EXISTS idx_public_id_report
+              ON public_id_registrations(report_id);
+            CREATE TABLE IF NOT EXISTS public_id_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              identifier TEXT NOT NULL,
+              registration_id INTEGER REFERENCES public_id_registrations(id),
+              report_id INTEGER REFERENCES reports(id),
+              action TEXT NOT NULL CHECK(action IN ('register','conflict','renew','withdraw','publish_block')),
+              detail TEXT NOT NULL DEFAULT '',
+              old_deadline TEXT,
+              new_deadline TEXT,
+              advisory_url TEXT NOT NULL DEFAULT '',
+              actor_id INTEGER REFERENCES users(id),
+              created_at TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -157,6 +194,10 @@ class VulnerabilityDB:
         self.add_evidence(report, "请求样例", "GET /admin HTTP/1.1\nX-Test: bypass", "private", reporter)
         self.set_status(report, "triaged", coordinator, "已确认复现")
         self.set_fix_plan(report, maintainer, "增加鉴权前置校验并补充回归测试", "2026-10-10")
+        self.register_public_id(
+            "CVE-2026-10001", report, (date.today() + timedelta(days=5)).isoformat(),
+            "https://example.example/advisories/CVE-2026-10001", coordinator,
+        )
 
     def add_user(self, name: str, role: str, organization: str = "") -> int:
         if not name.strip() or role not in {"coordinator", "maintainer", "reporter"}:
@@ -305,6 +346,7 @@ class VulnerabilityDB:
         payload["fix_plan"] = dict(self.conn.execute("SELECT * FROM fix_plans WHERE report_id=?", (report_id,)).fetchone() or {})
         payload["history"] = [dict(r) for r in self.conn.execute("SELECT * FROM status_history WHERE report_id=? ORDER BY id", (report_id,))]
         payload["extensions"] = [dict(r) for r in self.conn.execute("SELECT * FROM extensions WHERE report_id=? ORDER BY id", (report_id,))]
+        payload["public_id_registration"] = self.active_public_id_for_report(report_id)
         return payload
 
     def set_status(self, report_id: int, new_status: str, user_id: int, note: str = "") -> None:
@@ -314,6 +356,8 @@ class VulnerabilityDB:
         user = self._user(user_id)
         if user["role"] == "reporter" and new_status != "rejected":
             raise DomainError("报告人不能推进协调状态")
+        if new_status == "published":
+            self._assert_disclosable(report_id, date.today())
         if new_status not in STATUS_TRANSITIONS.get(report["status"], set()):
             raise DomainError(f"状态不能从 {report['status']} 变为 {new_status}")
         now = datetime.now().isoformat()
@@ -434,6 +478,25 @@ class VulnerabilityDB:
             raise DomainError("披露日期必须使用 YYYY-MM-DD") from exc
         if now_date < deadline:
             raise DomainError(f"保密期截至 {report['confidential_until']}，不能提前披露")
+        if report["status"] == "published":
+            raise DomainError("报告已公开，不能再次披露")
+        registration = self.conn.execute(
+            "SELECT * FROM public_id_registrations WHERE report_id=? AND status!='withdrawn' "
+            "ORDER BY id DESC LIMIT 1",
+            (report_id,),
+        ).fetchone()
+        if registration:
+            reserved_until = self._validate_day(registration["reserved_until"], "预留到期日")
+            if now_date > reserved_until:
+                message = (f"公开编号 {registration['identifier']} 预留已于 "
+                           f"{registration['reserved_until']} 到期，续期后才能披露")
+                with self.transaction():
+                    self._log_public_id_event(
+                        registration["identifier"], "publish_block", coordinator_id,
+                        registration["id"], report_id, message,
+                        registration["reserved_until"], None, registration["advisory_url"],
+                    )
+                raise DomainError(message)
         if report["status"] != "resolved":
             raise DomainError("只有已解决报告可以披露")
         self.set_status(report_id, "published", coordinator_id, f"公开日期 {when}")
@@ -454,6 +517,253 @@ class VulnerabilityDB:
         if report["status"] != "published":
             payload["status"] = "draft"
         return payload
+
+    def _validate_identifier(self, identifier: str) -> str:
+        value = identifier.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{2,63}", value):
+            raise DomainError("公开编号需为 3-64 位字母、数字或 ._- 且以字母数字开头")
+        return value
+
+    def _validate_day(self, value: str, field: str = "日期") -> date:
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise DomainError(f"{field}必须使用 YYYY-MM-DD") from exc
+
+    def _validate_advisory_url(self, advisory_url: str) -> str:
+        url = advisory_url.strip()
+        if not url:
+            raise DomainError("公告地址不能为空")
+        if not re.fullmatch(r"https?://[^\s]{2,2000}", url):
+            raise DomainError("公告地址必须是 http(s) 链接")
+        return url
+
+    def _report_or_error(self, report_id: int) -> sqlite3.Row:
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        return report
+
+    def _log_public_id_event(self, identifier: str, action: str, actor_id: int,
+                             registration_id: int | None = None, report_id: int | None = None,
+                             detail: str = "", old_deadline: str | None = None,
+                             new_deadline: str | None = None, advisory_url: str = "") -> None:
+        self.conn.execute(
+            "INSERT INTO public_id_events(identifier,registration_id,report_id,action,detail,"
+            "old_deadline,new_deadline,advisory_url,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (identifier, registration_id, report_id, action, detail, old_deadline, new_deadline,
+             advisory_url, actor_id, datetime.now().isoformat()),
+        )
+
+    def _registration_payload(self, row: sqlite3.Row) -> dict:
+        payload = dict(row)
+        report = self.conn.execute(
+            "SELECT r.id,r.public_id,r.title,r.status,p.name AS product_name FROM reports r "
+            "JOIN products p ON p.id=r.product_id WHERE r.id=?",
+            (row["report_id"],),
+        ).fetchone()
+        payload["report"] = dict(report) if report else None
+        return payload
+
+    def register_public_id(self, identifier: str, report_id: int, reserved_until: str,
+                           advisory_url: str, coordinator_id: int) -> dict:
+        """登记公开编号；编号已被未撤回登记持有时返回已有报告并记录冲突。"""
+        actor = self._user(coordinator_id)
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以登记公开编号")
+        public_id = self._validate_identifier(identifier)
+        deadline = self._validate_day(reserved_until, "预留到期日")
+        url = self._validate_advisory_url(advisory_url)
+        report = self._report_or_error(report_id)
+        if report["status"] == "published":
+            raise DomainError("报告已公开，不能再登记公开编号")
+        if report["status"] == "rejected":
+            raise DomainError("报告已拒绝，不能登记公开编号")
+        now = datetime.now().isoformat()
+        conflict: tuple[sqlite3.Row, sqlite3.Row] | None = None
+        registration_id: int | None = None
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM public_id_registrations WHERE identifier=? AND status!='withdrawn'",
+                (public_id,),
+            ).fetchone()
+            if existing:
+                if existing["report_id"] == report_id:
+                    return self._registration_payload(existing)
+                conflict = (existing, self._report_or_error(existing["report_id"]))
+            else:
+                cur = self.conn.execute(
+                    "INSERT INTO public_id_registrations(identifier,report_id,reserved_until,advisory_url,"
+                    "status,created_by,created_at,updated_at) VALUES(?,?,?,?, 'reserved',?,?,?)",
+                    (public_id, report_id, deadline.isoformat(), url, coordinator_id, now, now),
+                )
+                registration_id = int(cur.lastrowid)
+                self._log_public_id_event(
+                    public_id, "register", coordinator_id, registration_id, report_id,
+                    "登记公开编号", None, deadline.isoformat(), url,
+                )
+                self._notify(report_id, coordinator_id, "public_id", f"公开编号 {public_id} 已登记")
+        if conflict is not None:
+            # 冲突登记被拒绝，但处理记录必须保留，因此在独立事务中落库
+            existing, holder = conflict
+            with self.transaction():
+                self._log_public_id_event(
+                    public_id, "conflict", coordinator_id, existing["id"], report_id,
+                    f"报告 {report['public_id']} 重复登记，编号已归 {holder['public_id']}",
+                    existing["reserved_until"], None, url,
+                )
+            raise PublicIdConflict(
+                f"公开编号 {public_id} 已登记给报告 {holder['public_id']}",
+                self._registration_payload(existing),
+            )
+        return self._registration_payload(
+            self.conn.execute("SELECT * FROM public_id_registrations WHERE id=?", (registration_id,)).fetchone()
+        )
+
+    def renew_public_id(self, registration_id: int, new_deadline: str, coordinator_id: int,
+                        reason: str = "", advisory_url: str | None = None) -> dict:
+        """续期预留，保留新旧期限；只有协调员可操作。"""
+        actor = self._user(coordinator_id)
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以续期公开编号")
+        if len(reason.strip()) < 5:
+            raise DomainError("续期理由至少5个字符")
+        row = self.conn.execute(
+            "SELECT * FROM public_id_registrations WHERE id=?", (registration_id,)
+        ).fetchone()
+        if not row:
+            raise DomainError("编号登记不存在")
+        if row["status"] == "withdrawn":
+            raise DomainError("登记已撤回，不能续期")
+        report = self._report_or_error(row["report_id"])
+        if report["status"] == "published":
+            raise DomainError("报告已公开，不能续期")
+        new_date = self._validate_day(new_deadline, "新预留到期日")
+        old_date = self._validate_day(row["reserved_until"], "原预留到期日")
+        if new_date <= old_date:
+            raise DomainError("新预留到期日必须晚于当前预留到期日")
+        url = self._validate_advisory_url(advisory_url if advisory_url is not None else row["advisory_url"])
+        now = datetime.now().isoformat()
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE public_id_registrations SET reserved_until=?,advisory_url=?,status='renewed',updated_at=? WHERE id=?",
+                (new_date.isoformat(), url, now, registration_id),
+            )
+            self._log_public_id_event(
+                row["identifier"], "renew", coordinator_id, registration_id, row["report_id"],
+                reason.strip(), row["reserved_until"], new_date.isoformat(), url,
+            )
+            self._notify(row["report_id"], coordinator_id, "public_id",
+                         f"公开编号 {row['identifier']} 预留续期至 {new_date.isoformat()}")
+        return self._registration_payload(
+            self.conn.execute("SELECT * FROM public_id_registrations WHERE id=?", (registration_id,)).fetchone()
+        )
+
+    def withdraw_public_id(self, registration_id: int, coordinator_id: int, reason: str = "") -> dict:
+        """撤回登记以释放编号，供其他报告使用；撤回保留处理记录。"""
+        actor = self._user(coordinator_id)
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以撤回公开编号")
+        row = self.conn.execute(
+            "SELECT * FROM public_id_registrations WHERE id=?", (registration_id,)
+        ).fetchone()
+        if not row:
+            raise DomainError("编号登记不存在")
+        if row["status"] == "withdrawn":
+            raise DomainError("登记已撤回")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE public_id_registrations SET status='withdrawn',updated_at=? WHERE id=?",
+                (now, registration_id),
+            )
+            self._log_public_id_event(
+                row["identifier"], "withdraw", coordinator_id, registration_id, row["report_id"],
+                reason.strip(), row["reserved_until"], None, row["advisory_url"],
+            )
+            self._notify(row["report_id"], coordinator_id, "public_id",
+                         f"公开编号 {row['identifier']} 登记已撤回")
+        return self._registration_payload(
+            self.conn.execute("SELECT * FROM public_id_registrations WHERE id=?", (registration_id,)).fetchone()
+        )
+
+    def active_public_id_for_report(self, report_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM public_id_registrations WHERE report_id=? AND status!='withdrawn' "
+            "ORDER BY id DESC LIMIT 1",
+            (report_id,),
+        ).fetchone()
+        return self._registration_payload(row) if row else None
+
+    def public_id_ledger(self, within_days: int = 14) -> dict:
+        """台账视图：全部登记、冲突编号、即将到期项、处理记录。"""
+        if within_days < 0:
+            raise DomainError("预警天数不能为负")
+        today = date.today()
+        horizon = today + timedelta(days=within_days)
+        registrations = [
+            self._registration_payload(row)
+            for row in self.conn.execute(
+                "SELECT * FROM public_id_registrations ORDER BY id DESC"
+            ).fetchall()
+        ]
+        conflicts = []
+        for row in self.conn.execute(
+            "SELECT * FROM public_id_events WHERE action='conflict' ORDER BY id DESC"
+        ).fetchall():
+            event = dict(row)
+            holder = self.conn.execute(
+                "SELECT g.*,r.public_id AS report_public_id,r.title AS report_title,r.status AS report_status "
+                "FROM public_id_registrations g JOIN reports r ON r.id=g.report_id WHERE g.id=?",
+                (row["registration_id"],),
+            ).fetchone()
+            event["holder"] = self._registration_payload(holder) if holder else None
+            attempt = self.conn.execute(
+                "SELECT id,public_id,title,status FROM reports WHERE id=?", (row["report_id"],)
+            ).fetchone()
+            event["attempt_report"] = dict(attempt) if attempt else None
+            conflicts.append(event)
+        expiring = [
+            self._registration_payload(row)
+            for row in self.conn.execute(
+                "SELECT * FROM public_id_registrations WHERE status!='withdrawn' "
+                "AND date(reserved_until) BETWEEN date(?) AND date(?) ORDER BY reserved_until, id",
+                (today.isoformat(), horizon.isoformat()),
+            ).fetchall()
+        ]
+        events = [
+            dict(row)
+            for row in self.conn.execute(
+                "SELECT e.*,u.name AS actor_name FROM public_id_events e "
+                "LEFT JOIN users u ON u.id=e.actor_id ORDER BY e.id DESC"
+            ).fetchall()
+        ]
+        return {
+            "today": today.isoformat(),
+            "within_days": within_days,
+            "registrations": registrations,
+            "conflicts": conflicts,
+            "expiring": expiring,
+            "events": events,
+        }
+
+    def _assert_disclosable(self, report_id: int, when: date) -> None:
+        """已公开或编号预留到期未续期的报告不能再次披露。"""
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if report and report["status"] == "published":
+            raise DomainError("报告已公开，不能再次披露")
+        registration = self.conn.execute(
+            "SELECT * FROM public_id_registrations WHERE report_id=? AND status!='withdrawn' "
+            "ORDER BY id DESC LIMIT 1",
+            (report_id,),
+        ).fetchone()
+        if registration:
+            reserved_until = self._validate_day(registration["reserved_until"], "预留到期日")
+            if when > reserved_until:
+                raise DomainError(
+                    f"公开编号 {registration['identifier']} 预留已于 {registration['reserved_until']} 到期，"
+                    "续期后才能披露"
+                )
 
     def _notify(self, report_id: int, user_id: int, kind: str, message: str) -> None:
         self.conn.execute(
