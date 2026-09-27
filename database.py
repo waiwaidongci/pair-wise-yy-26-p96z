@@ -141,6 +141,33 @@ class VulnerabilityDB:
               created_at TEXT NOT NULL,
               published_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS identifier_registry (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              identifier TEXT NOT NULL,
+              report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+              advisory_url TEXT NOT NULL,
+              reserved_until TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'reserved' CHECK(status IN ('reserved','published','withdrawn')),
+              created_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              published_at TEXT,
+              withdrawn_at TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_identifier_active
+              ON identifier_registry(identifier) WHERE status IN ('reserved','published');
+            CREATE TABLE IF NOT EXISTS identifier_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              identifier TEXT NOT NULL,
+              registry_id INTEGER REFERENCES identifier_registry(id) ON DELETE SET NULL,
+              report_id INTEGER,
+              action TEXT NOT NULL CHECK(action IN ('register','duplicate','renew','publish','withdraw','blocked')),
+              old_until TEXT,
+              new_until TEXT,
+              detail TEXT NOT NULL DEFAULT '',
+              actor_id INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -157,6 +184,10 @@ class VulnerabilityDB:
         self.add_evidence(report, "请求样例", "GET /admin HTTP/1.1\nX-Test: bypass", "private", reporter)
         self.set_status(report, "triaged", coordinator, "已确认复现")
         self.set_fix_plan(report, maintainer, "增加鉴权前置校验并补充回归测试", "2026-10-10")
+        self.register_identifier(
+            report, "CVE-2026-44113", (datetime.now().date() + timedelta(days=33)).isoformat(),
+            "https://example.com/advisories/gateway-auth-bypass", coordinator,
+        )
 
     def add_user(self, name: str, role: str, organization: str = "") -> int:
         if not name.strip() or role not in {"coordinator", "maintainer", "reporter"}:
@@ -454,6 +485,214 @@ class VulnerabilityDB:
         if report["status"] != "published":
             payload["status"] = "draft"
         return payload
+
+    # ---- 公开编号台账 ----
+
+    @staticmethod
+    def _normalize_identifier(identifier: str) -> str:
+        return identifier.strip().upper()
+
+    @staticmethod
+    def _as_of_date(as_of: str | None) -> date:
+        if not as_of:
+            return datetime.now().date()
+        try:
+            return datetime.strptime(as_of, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise DomainError("日期必须使用 YYYY-MM-DD") from exc
+
+    def _active_identifier(self, identifier: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM identifier_registry WHERE identifier=? AND status IN ('reserved','published')",
+            (identifier,),
+        ).fetchone()
+
+    def _identifier_payload(self, row: sqlite3.Row, duplicate: bool = False) -> dict:
+        report = self.conn.execute("SELECT public_id,title FROM reports WHERE id=?", (row["report_id"],)).fetchone()
+        payload = dict(row)
+        payload["report_public_id"] = report["public_id"]
+        payload["report_title"] = report["title"]
+        payload["duplicate"] = duplicate
+        return payload
+
+    def _log_identifier_event(self, identifier: str, registry_id: int | None, report_id: int | None,
+                              action: str, actor_id: int, old_until: str | None = None,
+                              new_until: str | None = None, detail: str = "") -> None:
+        self.conn.execute(
+            "INSERT INTO identifier_events(identifier,registry_id,report_id,action,old_until,new_until,detail,actor_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (identifier, registry_id, report_id, action, old_until, new_until, detail, actor_id, datetime.now().isoformat()),
+        )
+
+    def register_identifier(self, report_id: int, identifier: str, reserved_until: str,
+                            advisory_url: str, coordinator_id: int, as_of: str | None = None) -> dict:
+        actor = self._user(coordinator_id)
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以登记公开编号")
+        if not self.conn.execute("SELECT 1 FROM reports WHERE id=?", (report_id,)).fetchone():
+            raise DomainError("报告不存在")
+        ident = self._normalize_identifier(identifier)
+        if not ident or not advisory_url.strip():
+            raise DomainError("公开编号和公告地址不能为空")
+        try:
+            until = datetime.strptime(reserved_until, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise DomainError("预留到期日必须使用 YYYY-MM-DD") from exc
+        if until < self._as_of_date(as_of):
+            raise DomainError("预留到期日不能早于今天")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            existing = self._active_identifier(ident)
+            if existing:
+                detail = "重复登记，返回已有报告"
+                if existing["report_id"] != report_id:
+                    detail = f"编号冲突：编号仍归属报告 {existing['report_id']}"
+                self._log_identifier_event(ident, existing["id"], report_id, "duplicate", coordinator_id, detail=detail)
+                return self._identifier_payload(existing, duplicate=True)
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO identifier_registry(identifier,report_id,advisory_url,reserved_until,created_by,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (ident, report_id, advisory_url.strip(), reserved_until, coordinator_id, now, now),
+                )
+            except sqlite3.IntegrityError:
+                existing = self._active_identifier(ident)
+                self._log_identifier_event(ident, existing["id"], report_id, "duplicate", coordinator_id, detail="重复登记，返回已有报告")
+                return self._identifier_payload(existing, duplicate=True)
+            self._log_identifier_event(ident, int(cur.lastrowid), report_id, "register", coordinator_id, new_until=reserved_until)
+            row = self.conn.execute("SELECT * FROM identifier_registry WHERE id=?", (cur.lastrowid,)).fetchone()
+            return self._identifier_payload(row)
+
+    def renew_identifier(self, identifier: str, new_until: str, coordinator_id: int, as_of: str | None = None) -> dict:
+        actor = self._user(coordinator_id)
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以续期公开编号")
+        ident = self._normalize_identifier(identifier)
+        row = self._active_identifier(ident)
+        if not row:
+            raise DomainError("编号不存在或已撤回")
+        if row["status"] != "reserved":
+            raise DomainError("已公开的编号不能续期")
+        try:
+            new_date = datetime.strptime(new_until, "%Y-%m-%d").date()
+            old_date = datetime.strptime(row["reserved_until"], "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise DomainError("预留到期日必须使用 YYYY-MM-DD") from exc
+        if new_date <= old_date:
+            raise DomainError("新预留到期日必须晚于当前到期日")
+        if new_date < self._as_of_date(as_of):
+            raise DomainError("新预留到期日不能早于今天")
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE identifier_registry SET reserved_until=?,updated_at=? WHERE id=?",
+                (new_until, datetime.now().isoformat(), row["id"]),
+            )
+            self._log_identifier_event(ident, row["id"], row["report_id"], "renew", coordinator_id,
+                                       old_until=row["reserved_until"], new_until=new_until,
+                                       detail=f"预留期 {row['reserved_until']} 延至 {new_until}")
+        return self._identifier_payload(self._active_identifier(ident))
+
+    def publish_identifier(self, identifier: str, coordinator_id: int, as_of: str | None = None) -> dict:
+        actor = self._user(coordinator_id)
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以披露公开编号")
+        ident = self._normalize_identifier(identifier)
+        row = self._active_identifier(ident)
+        if not row:
+            raise DomainError("编号不存在或已撤回")
+        if row["status"] == "published":
+            raise DomainError("该编号已公开，不能再次披露")
+        today = self._as_of_date(as_of)
+        until = datetime.strptime(row["reserved_until"], "%Y-%m-%d").date()
+        if today > until:
+            with self.transaction():
+                self._log_identifier_event(ident, row["id"], row["report_id"], "blocked", coordinator_id,
+                                           detail=f"预留已于 {row['reserved_until']} 到期且未续期")
+            raise DomainError(f"预留已于 {row['reserved_until']} 到期且未续期，不能披露")
+        when = today.isoformat()
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE identifier_registry SET status='published',published_at=?,updated_at=? WHERE id=?",
+                (when, datetime.now().isoformat(), row["id"]),
+            )
+            self._log_identifier_event(ident, row["id"], row["report_id"], "publish", coordinator_id,
+                                       detail=f"编号公开，公告地址 {row['advisory_url']}")
+        return self._identifier_payload(self._active_identifier(ident))
+
+    def withdraw_identifier(self, identifier: str, coordinator_id: int, reason: str = "") -> dict:
+        actor = self._user(coordinator_id)
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以撤回公开编号")
+        ident = self._normalize_identifier(identifier)
+        row = self._active_identifier(ident)
+        if not row:
+            raise DomainError("编号不存在或已撤回")
+        if row["status"] == "published":
+            raise DomainError("已公开的编号不能撤回")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE identifier_registry SET status='withdrawn',withdrawn_at=?,updated_at=? WHERE id=?",
+                (now, now, row["id"]),
+            )
+            self._log_identifier_event(ident, row["id"], row["report_id"], "withdraw", coordinator_id,
+                                       detail=reason.strip() or "协调员撤回")
+        row = self.conn.execute("SELECT * FROM identifier_registry WHERE id=?", (row["id"],)).fetchone()
+        return self._identifier_payload(row)
+
+    def identifier_registry(self, as_of: str | None = None) -> list[dict]:
+        today = self._as_of_date(as_of)
+        rows = self.conn.execute(
+            "SELECT i.*,r.public_id AS report_public_id,r.title AS report_title,u.name AS created_by_name "
+            "FROM identifier_registry i JOIN reports r ON r.id=i.report_id JOIN users u ON u.id=i.created_by ORDER BY i.id"
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            until = datetime.strptime(item["reserved_until"], "%Y-%m-%d").date()
+            item["expired"] = item["status"] == "reserved" and until < today
+            result.append(item)
+        return result
+
+    def identifier_conflicts(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT e.identifier,e.report_id AS attempted_report_id,i.report_id AS owner_report_id,"
+            "e.detail,e.created_at,r1.public_id AS attempted_public_id,r2.public_id AS owner_public_id "
+            "FROM identifier_events e JOIN identifier_registry i ON i.id=e.registry_id "
+            "JOIN reports r1 ON r1.id=e.report_id JOIN reports r2 ON r2.id=i.report_id "
+            "WHERE e.action='duplicate' AND e.report_id!=i.report_id ORDER BY e.id DESC"
+        )]
+
+    def identifier_expiring(self, within_days: int = 14, as_of: str | None = None) -> list[dict]:
+        today = self._as_of_date(as_of)
+        horizon = (today + timedelta(days=within_days)).isoformat()
+        rows = self.conn.execute(
+            "SELECT i.*,r.public_id AS report_public_id,r.title AS report_title FROM identifier_registry i "
+            "JOIN reports r ON r.id=i.report_id WHERE i.status='reserved' AND i.reserved_until<=? ORDER BY i.reserved_until",
+            (horizon,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            until = datetime.strptime(item["reserved_until"], "%Y-%m-%d").date()
+            item["days_left"] = (until - today).days
+            item["expired"] = until < today
+            result.append(item)
+        return result
+
+    def identifier_events(self, limit: int = 50) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT e.*,u.name AS actor_name FROM identifier_events e JOIN users u ON u.id=e.actor_id "
+            "ORDER BY e.id DESC LIMIT ?", (limit,),
+        )]
+
+    def identifier_overview(self, as_of: str | None = None, within_days: int = 14) -> dict:
+        return {
+            "registry": self.identifier_registry(as_of),
+            "conflicts": self.identifier_conflicts(),
+            "expiring": self.identifier_expiring(within_days, as_of),
+            "events": self.identifier_events(),
+        }
 
     def _notify(self, report_id: int, user_id: int, kind: str, message: str) -> None:
         self.conn.execute(
